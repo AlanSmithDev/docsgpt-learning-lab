@@ -1,0 +1,715 @@
+import { File, Folder, TriangleAlert } from 'lucide-react';
+import React, {
+  Fragment,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+} from 'react';
+import { useTranslation } from 'react-i18next';
+import userService from '../api/services/userService';
+import { formatBytes } from '../utils/stringUtils';
+import { formatDateTime } from '../utils/dateTimeUtils';
+import { useDispatch, useSelector } from 'react-redux';
+import connectorsService from '../api/services/connectorsService';
+import ConnectorAuth from '../components/ConnectorAuth';
+import ConnectorIcon from '../connectors/ConnectorIcon';
+import { connectorIconKey } from '../connectors/i18n';
+import {
+  loadConnectors,
+  selectConnections,
+} from '../connectors/connectorsSlice';
+import type { AppDispatch } from '../store';
+import { FormField } from './ui/form-field';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from './ui/select';
+import SearchInput from './SearchInput';
+import { Alert, AlertDescription } from './ui/alert';
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from './ui/breadcrumb';
+import { Checkbox } from './ui/checkbox';
+import { Skeleton } from './ui/skeleton';
+import {
+  Table,
+  TableContainer,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeader,
+  TableCell,
+} from './ui/table';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
+import { useDebouncedCallback } from '../hooks';
+
+interface CloudFile {
+  id: string;
+  name: string;
+  type: string;
+  size?: number;
+  modifiedTime: string;
+  isFolder?: boolean;
+}
+
+/**
+ * The file browser under the drive tabs. With the tabs shown it is the active
+ * tab's panel; without them (one drive) it renders as is.
+ */
+function DrivePanel({
+  tabbed,
+  value,
+  children,
+}: {
+  tabbed: boolean;
+  value: string;
+  children: React.ReactNode;
+}) {
+  return tabbed ? (
+    <TabsContent value={value}>{children}</TabsContent>
+  ) : (
+    <>{children}</>
+  );
+}
+
+interface CloudFilePickerProps {
+  onSelectionChange: (
+    selectedFileIds: string[],
+    selectedFolderIds?: string[],
+  ) => void;
+  onDisconnect?: () => void;
+  /** Called with the first item's name when the selection goes from empty to one. */
+  onFirstPickName?: (name: string) => void;
+  /**
+   * The connection (signed-in account) to browse. Left out, the picker uses
+   * the first connected account for ``provider`` and lets the user switch.
+   */
+  connectionId?: string | null;
+  /** Reports the account the picker is browsing, so the upload can name it. */
+  onConnectionChange?: (connectionId: string | null) => void;
+  provider: string;
+  token: string | null;
+  initialSelectedFiles?: string[];
+  initialSelectedFolders?: string[];
+}
+
+export const FilePicker: React.FC<CloudFilePickerProps> = ({
+  onSelectionChange,
+  onDisconnect,
+  onFirstPickName,
+  connectionId: controlledConnectionId,
+  onConnectionChange,
+  provider,
+  token,
+  initialSelectedFiles = [],
+}) => {
+  const { t } = useTranslation();
+  const dispatch = useDispatch<AppDispatch>();
+  const PROVIDER_CONFIG = {
+    google_drive: {
+      displayName: 'Drive',
+      rootName: t('filePicker.myDrive'),
+    },
+    share_point: {
+      displayName: 'SharePoint',
+      rootName: t('filePicker.myFiles'),
+    },
+    confluence: {
+      displayName: 'Confluence',
+      rootName: t('filePicker.spaces'),
+    },
+  };
+
+  const getProviderConfig = (provider: string) => {
+    return (
+      PROVIDER_CONFIG[provider as keyof typeof PROVIDER_CONFIG] || {
+        displayName: provider,
+        rootName: t('filePicker.root'),
+      }
+    );
+  };
+
+  const allConnections = useSelector(selectConnections);
+  const accounts = allConnections.filter(
+    (connection) =>
+      connection.connector_key === provider &&
+      connection.status === 'connected',
+  );
+  const [chosenConnectionId, setChosenConnectionId] = useState<string | null>(
+    null,
+  );
+  const activeConnectionId =
+    controlledConnectionId ??
+    (chosenConnectionId &&
+    accounts.some((account) => account.id === chosenConnectionId)
+      ? chosenConnectionId
+      : (accounts[0]?.id ?? null));
+  const activeAccount = accounts.find((a) => a.id === activeConnectionId);
+
+  const [files, setFiles] = useState<CloudFile[]>([]);
+  const [selectedFiles, setSelectedFiles] =
+    useState<string[]>(initialSelectedFiles);
+  const [selectedFolders, setSelectedFolders] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [hasMoreFiles, setHasMoreFiles] = useState(false);
+  const [nextPageToken, setNextPageToken] = useState<string | null>(null);
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+  const [folderPath, setFolderPath] = useState<
+    Array<{ id: string | null; name: string }>
+  >([
+    {
+      id: null,
+      name: getProviderConfig(provider).rootName,
+    },
+  ]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [authError, setAuthError] = useState<string>('');
+  const [allowsSharedContent, setAllowsSharedContent] = useState(false);
+  const [activeTab, setActiveTab] = useState<'my_files' | 'shared'>('my_files');
+
+  const isConnected = !!activeConnectionId;
+
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    onConnectionChange?.(activeConnectionId);
+  }, [activeConnectionId]);
+
+  const isFolder = (file: CloudFile) => {
+    return (
+      file.isFolder ||
+      file.type === 'application/vnd.google-apps.folder' ||
+      file.type === 'folder'
+    );
+  };
+
+  const loadCloudFiles = useCallback(
+    async (
+      connectionId: string,
+      folderId: string | null,
+      pageToken?: string,
+      searchQuery = '',
+      shared = false,
+    ) => {
+      // Cancel any in-flight request so stale responses never overwrite new state
+      abortControllerRef.current?.abort();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      setIsLoading(true);
+
+      if (!pageToken) {
+        setFiles([]);
+      }
+
+      try {
+        const body: Record<string, unknown> = {
+          provider: provider,
+          connection_id: connectionId,
+          folder_id: folderId,
+          limit: 10,
+          page_token: pageToken,
+          search_query: searchQuery,
+          shared: shared,
+        };
+        const response = await userService.getConnectorFiles(
+          body,
+          token,
+          controller.signal,
+        );
+
+        const data = await response.json();
+        if (data.success) {
+          setFiles((prev) =>
+            pageToken ? [...prev, ...data.files] : data.files,
+          );
+          setNextPageToken(data.next_page_token);
+          setHasMoreFiles(!!data.next_page_token);
+        } else {
+          if (data.reconnect) {
+            setAuthError(
+              t('filePicker.sessionExpiredFor', {
+                provider: getProviderConfig(provider).displayName,
+              }),
+            );
+            dispatch(loadConnectors({ token }));
+          }
+          if (!pageToken) {
+            setFiles([]);
+          }
+        }
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return;
+        console.error('Error loading files:', err);
+        if (!pageToken) {
+          setFiles([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsLoading(false);
+        }
+      }
+    },
+    [token, provider],
+  );
+
+  // Browse from the root whenever the account changes.
+  useEffect(() => {
+    setFiles([]);
+    setNextPageToken(null);
+    setHasMoreFiles(false);
+    setCurrentFolderId(null);
+    setActiveTab('my_files');
+    setAllowsSharedContent(false);
+    setFolderPath([{ id: null, name: getProviderConfig(provider).rootName }]);
+    if (!activeConnectionId) return;
+    setAuthError('');
+    loadCloudFiles(activeConnectionId, null, undefined, '');
+    if (provider === 'share_point') {
+      // Work and school accounts can browse "Shared with me" too.
+      connectorsService
+        .pickerToken(activeConnectionId, token)
+        .then((data) => setAllowsSharedContent(!!data?.allows_shared_content))
+        .catch(() => undefined);
+    }
+  }, [activeConnectionId, provider, loadCloudFiles]);
+
+  const handleScroll = useCallback(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainer;
+    const isNearBottom = scrollHeight - scrollTop - clientHeight < 50;
+
+    if (
+      isNearBottom &&
+      hasMoreFiles &&
+      !isLoading &&
+      nextPageToken &&
+      activeConnectionId
+    ) {
+      loadCloudFiles(
+        activeConnectionId,
+        currentFolderId,
+        nextPageToken,
+        searchQuery,
+        activeTab === 'shared' && !currentFolderId,
+      );
+    }
+  }, [
+    hasMoreFiles,
+    isLoading,
+    nextPageToken,
+    currentFolderId,
+    searchQuery,
+    activeConnectionId,
+    loadCloudFiles,
+    activeTab,
+  ]);
+
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (scrollContainer) {
+      scrollContainer.addEventListener('scroll', handleScroll);
+      return () => scrollContainer.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
+  const debouncedLoadFiles = useDebouncedCallback((query: string) => {
+    if (activeConnectionId) {
+      loadCloudFiles(
+        activeConnectionId,
+        currentFolderId,
+        undefined,
+        query,
+        activeTab === 'shared' && !currentFolderId,
+      );
+    }
+  }, 300);
+
+  const handleSearchChange = (query: string) => {
+    setSearchQuery(query);
+    debouncedLoadFiles(query);
+  };
+
+  const handleFolderClick = (folderId: string, folderName: string) => {
+    if (folderId === currentFolderId) {
+      return;
+    }
+
+    setIsLoading(true);
+
+    setCurrentFolderId(folderId);
+    setFolderPath((prev) => [...prev, { id: folderId, name: folderName }]);
+    setSearchQuery('');
+
+    if (activeConnectionId) {
+      loadCloudFiles(activeConnectionId, folderId, undefined, '', false);
+    }
+  };
+
+  const navigateBack = (index: number) => {
+    if (index >= folderPath.length - 1) return;
+
+    const newFolderPath = folderPath.slice(0, index + 1);
+    const newFolderId = newFolderPath[newFolderPath.length - 1].id;
+
+    setFolderPath(newFolderPath);
+    setCurrentFolderId(newFolderId);
+    setSearchQuery('');
+
+    if (activeConnectionId) {
+      loadCloudFiles(
+        activeConnectionId,
+        newFolderId,
+        undefined,
+        '',
+        activeTab === 'shared' && !newFolderId,
+      );
+    }
+  };
+
+  const showDriveTabs = provider === 'share_point' && allowsSharedContent;
+
+  const handleTabChange = (tab: 'my_files' | 'shared') => {
+    if (tab === activeTab) return;
+    setActiveTab(tab);
+    setFiles([]);
+    setNextPageToken(null);
+    setHasMoreFiles(false);
+    setCurrentFolderId(null);
+    setSearchQuery('');
+    setFolderPath([
+      {
+        id: null,
+        name:
+          tab === 'shared'
+            ? t('filePicker.shared')
+            : getProviderConfig(provider).rootName,
+      },
+    ]);
+    if (activeConnectionId) {
+      loadCloudFiles(activeConnectionId, null, undefined, '', tab === 'shared');
+    }
+  };
+
+  const handleFileSelect = (fileId: string, isFolder: boolean) => {
+    if (
+      selectedFiles.length === 0 &&
+      selectedFolders.length === 0 &&
+      onFirstPickName
+    ) {
+      const picked = files.find((file) => file.id === fileId);
+      if (picked) onFirstPickName(picked.name);
+    }
+    if (isFolder) {
+      const newSelectedFolders = selectedFolders.includes(fileId)
+        ? selectedFolders.filter((id) => id !== fileId)
+        : [...selectedFolders, fileId];
+      setSelectedFolders(newSelectedFolders);
+      onSelectionChange(selectedFiles, newSelectedFolders);
+    } else {
+      const newSelectedFiles = selectedFiles.includes(fileId)
+        ? selectedFiles.filter((id) => id !== fileId)
+        : [...selectedFiles, fileId];
+      setSelectedFiles(newSelectedFiles);
+      onSelectionChange(newSelectedFiles, selectedFolders);
+    }
+  };
+
+  const switchAccount = (connectionId: string) => {
+    setChosenConnectionId(connectionId);
+    setSelectedFiles([]);
+    setSelectedFolders([]);
+    onSelectionChange([], []);
+  };
+
+  return (
+    <div className="">
+      {authError && (
+        <Alert variant="destructive" className="mb-4">
+          <TriangleAlert aria-hidden="true" />
+          <AlertDescription>{authError}</AlertDescription>
+        </Alert>
+      )}
+
+      {accounts.length > 1 && !controlledConnectionId && (
+        <FormField label={t('filePicker.account')} className="mb-4">
+          <Select
+            value={activeConnectionId ?? undefined}
+            onValueChange={switchAccount}
+          >
+            <SelectTrigger size="field" shape="pill" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {accounts.map((account) => (
+                <SelectItem key={account.id} value={account.id}>
+                  {account.account_label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </FormField>
+      )}
+
+      <ConnectorAuth
+        provider={provider}
+        label={t('filePicker.connectTo', {
+          provider: getProviderConfig(provider).displayName,
+        })}
+        icon={
+          <ConnectorIcon icon={connectorIconKey(provider)} className="size-5" />
+        }
+        onSuccess={(data) => {
+          setAuthError('');
+          dispatch(loadConnectors({ token }));
+          if (data.connection_id) setChosenConnectionId(data.connection_id);
+        }}
+        onError={(error) => {
+          setAuthError(error);
+        }}
+        isConnected={isConnected}
+        userEmail={
+          activeAccount?.account_label ||
+          t('modals.uploadDoc.connectors.auth.connectedUser')
+        }
+        onDisconnect={() => {
+          if (activeConnectionId) {
+            connectorsService
+              .disconnect(activeConnectionId, token)
+              .catch((err) =>
+                console.error(
+                  `Error disconnecting from ${getProviderConfig(provider).displayName}:`,
+                  err,
+                ),
+              )
+              .finally(() => dispatch(loadConnectors({ token })));
+          }
+          setChosenConnectionId(null);
+          setAllowsSharedContent(false);
+          setActiveTab('my_files');
+          setFiles([]);
+          setSelectedFiles([]);
+          onSelectionChange([]);
+
+          if (onDisconnect) {
+            onDisconnect();
+          }
+        }}
+      />
+
+      {isConnected && (
+        <div className="border-border mt-3 overflow-hidden rounded-lg border">
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) =>
+              handleTabChange(value as 'my_files' | 'shared')
+            }
+          >
+            {showDriveTabs && (
+              <TabsList variant="underline">
+                <TabsTrigger variant="underline" value="my_files">
+                  {t('filePicker.myFiles')}
+                </TabsTrigger>
+                <TabsTrigger variant="underline" value="shared">
+                  {t('filePicker.sharedWithMe')}
+                </TabsTrigger>
+              </TabsList>
+            )}
+            <DrivePanel tabbed={showDriveTabs} value={activeTab}>
+              <div className="bg-muted rounded-t-lg px-4 pt-4">
+                <Breadcrumb className="mb-2 min-w-0">
+                  <BreadcrumbList className="flex-nowrap">
+                    {folderPath.map((path, index) => (
+                      <Fragment key={path.id || 'root'}>
+                        {index > 0 && <BreadcrumbSeparator />}
+                        {index === folderPath.length - 1 ? (
+                          <BreadcrumbItem className="min-w-0">
+                            <BreadcrumbPage
+                              title={path.name}
+                              className="max-w-[32ch]"
+                            >
+                              {path.name}
+                            </BreadcrumbPage>
+                          </BreadcrumbItem>
+                        ) : (
+                          <BreadcrumbItem>
+                            <BreadcrumbLink asChild>
+                              <button
+                                type="button"
+                                onClick={() => navigateBack(index)}
+                              >
+                                {path.name}
+                              </button>
+                            </BreadcrumbLink>
+                          </BreadcrumbItem>
+                        )}
+                      </Fragment>
+                    ))}
+                  </BreadcrumbList>
+                </Breadcrumb>
+
+                <div className="text-muted-foreground mb-3 text-sm">
+                  {t('filePicker.selectFilesFrom', {
+                    provider: getProviderConfig(provider).displayName,
+                  })}
+                </div>
+
+                <div className="mb-3 max-w-md">
+                  <SearchInput
+                    label={t('filePicker.searchPlaceholder')}
+                    value={searchQuery}
+                    onChange={(e) => handleSearchChange(e.target.value)}
+                    labelSurface="muted"
+                  />
+                </div>
+
+                {/* Selected Files Message */}
+                <div className="text-muted-foreground pb-3 text-sm">
+                  {t('filePicker.itemsSelected', {
+                    count: selectedFiles.length + selectedFolders.length,
+                  })}
+                </div>
+              </div>
+
+              <div className="border-border scrollbar-overlay h-72 border-t">
+                <TableContainer
+                  ref={scrollContainerRef}
+                  height="288px"
+                  className="md:w-4xl lg:w-5xl"
+                  bordered={false}
+                >
+                  {
+                    <>
+                      <Table minWidth="1200px">
+                        <TableHead>
+                          <TableRow>
+                            <TableHeader width="40px"></TableHeader>
+                            <TableHeader width="60%">
+                              {t('filePicker.name')}
+                            </TableHeader>
+                            <TableHeader width="20%">
+                              {t('filePicker.lastModified')}
+                            </TableHeader>
+                            <TableHeader width="20%">
+                              {t('filePicker.size')}
+                            </TableHeader>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {isLoading && files.length === 0
+                            ? Array.from({ length: 5 }).map((_, i) => (
+                                <TableRow key={`skeleton-${i}`}>
+                                  <TableCell width="40px" align="center">
+                                    <Skeleton className="mx-auto size-5" />
+                                  </TableCell>
+                                  <TableCell>
+                                    <Skeleton className="h-4 w-48" />
+                                  </TableCell>
+                                  <TableCell>
+                                    <Skeleton className="h-4 w-24" />
+                                  </TableCell>
+                                  <TableCell>
+                                    <Skeleton className="h-4 w-16" />
+                                  </TableCell>
+                                </TableRow>
+                              ))
+                            : files.map((file, index) => (
+                                <TableRow
+                                  key={`${file.id}-${index}`}
+                                  onClick={() => {
+                                    if (isFolder(file)) {
+                                      handleFolderClick(file.id, file.name);
+                                    } else {
+                                      handleFileSelect(file.id, false);
+                                    }
+                                  }}
+                                >
+                                  <TableCell width="40px" align="center">
+                                    <Checkbox
+                                      size="sm"
+                                      className="align-middle"
+                                      aria-label={file.name}
+                                      checked={(isFolder(file)
+                                        ? selectedFolders
+                                        : selectedFiles
+                                      ).includes(file.id)}
+                                      onClick={(e) => e.stopPropagation()}
+                                      onCheckedChange={() =>
+                                        handleFileSelect(
+                                          file.id,
+                                          isFolder(file),
+                                        )
+                                      }
+                                    />
+                                  </TableCell>
+                                  <TableCell>
+                                    <div className="flex min-w-0 items-center gap-3">
+                                      <div className="shrink-0">
+                                        {isFolder(file) ? (
+                                          <Folder className="text-primary size-6" />
+                                        ) : (
+                                          <File className="text-muted-foreground size-6" />
+                                        )}
+                                      </div>
+                                      <span className="truncate">
+                                        {file.name}
+                                      </span>
+                                    </div>
+                                  </TableCell>
+                                  <TableCell className="text-xs">
+                                    {formatDateTime(file.modifiedTime)}
+                                  </TableCell>
+                                  <TableCell className="text-xs">
+                                    {file.size ? formatBytes(file.size) : '-'}
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                          {isLoading &&
+                            files.length > 0 &&
+                            Array.from({ length: 3 }).map((_, i) => (
+                              <TableRow key={`load-more-skeleton-${i}`}>
+                                <TableCell width="40px" align="center">
+                                  <Skeleton className="mx-auto size-5" />
+                                </TableCell>
+                                <TableCell>
+                                  <Skeleton className="h-4 w-48" />
+                                </TableCell>
+                                <TableCell>
+                                  <Skeleton className="h-4 w-24" />
+                                </TableCell>
+                                <TableCell>
+                                  <Skeleton className="h-4 w-16" />
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                        </TableBody>
+                      </Table>
+                    </>
+                  }
+                </TableContainer>
+              </div>
+            </DrivePanel>
+          </Tabs>
+        </div>
+      )}
+    </div>
+  );
+};
