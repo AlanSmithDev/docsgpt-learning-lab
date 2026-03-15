@@ -1,0 +1,160 @@
+---
+title: 'Changelog'
+description: What changed in each DocsGPT release, with links to the upgrade steps an existing deployment needs.
+---
+
+import { Callout } from 'nextra/components'
+
+# Changelog
+
+The notable changes in each release. Every release on GitHub also carries
+[auto-generated notes](https://github.com/arc53/DocsGPT/releases) listing every merged pull
+request, and [Upgrading](/upgrading) covers the steps an existing deployment has to take.
+
+## Unreleased
+
+### A development loop in one command
+
+`docsgpt dev` runs this checkout's API and worker as children of one terminal, both restarting when
+you save, with their output interleaved and Ctrl-C stopping them together. `--ui` adds the Vite dev
+server and `--mock-llm` runs the bundled mock model, so a working loop needs no API key.
+`docsgpt doctor` checks PostgreSQL, its schema version, Redis, the model provider and the port;
+`docsgpt restart` bounces the services without touching settings; `docsgpt logs -f` now follows a
+native install; and `docsgpt env set` applies itself to a running native install instead of asking
+you to run `docsgpt up` again. See
+[Setting up a development environment](/Deploying/Development-Environment).
+
+### Run DocsGPT without Docker
+
+`docsgpt up --native` runs the API and the worker as services on the machine itself, launchd on
+macOS and systemd user units on Linux, against a PostgreSQL and Redis you already have
+(`--postgres-uri`, `--redis-url`). `status`, `logs`, `down` and `uninstall` work on such an install
+the same way they do on a Docker one, and never touch the database or Redis. See
+[Run it as services, without Docker](/Deploying/Pip-Install#run-it-as-services-without-docker).
+
+### Back up and restore an install
+
+`docsgpt backup` writes a dump of the database and a tar of each data volume into one archive, and
+`docsgpt restore <archive>` puts them back. The settings file is left out unless
+`--with-settings` asks for it, since it holds the install's secrets, and a backup from a newer
+DocsGPT is refused unless you pass `--force`. The archive is written readable only by its owner,
+and the backend and the worker pause while it is made so the dump and the volume tars match. See
+[Backups](/Deploying/Docker-Deploying#backups).
+
+## 0.21.0
+
+### Install with one command
+
+`curl -fsSL https://docs.ac/install | bash` on macOS and Linux, or `irm https://docs.ac/install.ps1 | iex`
+in Windows PowerShell, installs uv and the `docsgpt` package and runs `docsgpt up`. Running it again
+upgrades and keeps your settings. On Linux it offers to install Docker when it is missing. Both
+scripts are attached to every release. See the [Quickstart](/quickstart).
+
+### `docsgpt up` runs DocsGPT on Docker
+
+The Python package now sets up and runs the Docker stack: `uv tool install docsgpt`, then
+`docsgpt up`. The first run asks who should reach DocsGPT (this computer, the network with an
+access token, or a domain with HTTPS) and which model provider to use, writes the settings and
+secrets to `~/.docsgpt/server/.env`, and starts the images of the installed version. `docsgpt status`,
+`logs`, `token`, `upgrade`, `down` and `uninstall` manage it afterwards. See
+[Run it with `docsgpt up`](/Deploying/Docker-Deploying#run-it-with-docsgpt-up).
+
+### An installed package keeps its data in `~/.docsgpt/server`
+
+Outside a source checkout, the data home (`.env`, uploads, indexes, models) was the directory
+the command ran from, so starting `docsgpt api` from another folder silently used other
+settings. It is now `~/.docsgpt/server`, or `/opt/docsgpt` for root on Linux; `DOCSGPT_HOME`
+still overrides it. See [Upgrading](/upgrading#pip-installs-data-home-moved).
+
+### The standalone Docker stack runs on one port
+
+The `arc53/docsgpt` image now serves the web UI next to the API, the way `docsgpt api` does from
+the Python package. `docker-compose-standalone.yaml` no longer runs a frontend container: the UI
+and the API share port 7091, published on `127.0.0.1` by default. The UI takes its API address
+from the page it was loaded from, so opening the stack from another machine works without
+setting `VITE_API_HOST`. New Compose settings: `DOCSGPT_BIND` and `DOCSGPT_PORT` for where the
+port is published, `POSTGRES_PASSWORD`, and an `https` profile that puts Caddy with an automatic
+certificate in front of a public domain. The `arc53/docsgpt-fe` image is still published for the
+checkout Compose files and Kubernetes. See
+[Upgrading from an earlier standalone file](/Deploying/Docker-Deploying#upgrading-from-an-earlier-standalone-file).
+
+## 0.20.0
+
+### DocsGPT installs from PyPI
+
+The backend is published as [`docsgpt`](https://pypi.org/project/docsgpt/): the API server, the
+web UI, the Celery worker and the maintenance scripts in one package, behind a single `docsgpt`
+command. `pip install docsgpt` then `docsgpt api` serves the API and the UI on one port, and
+`docsgpt worker` runs the worker. The optional engines are extras, `docsgpt[docling]` and
+`docsgpt[milvus]`. See [Install with pip](/Deploying/Pip-Install).
+
+### The Python package is now `docsgpt`
+
+The import package was renamed from `application` to `docsgpt`, the name it has on PyPI. Entry
+points move with it: `celery -A docsgpt.app.celery worker` and
+`uvicorn docsgpt.asgi:asgi_app`. The old spellings still run for this release and print a
+`FutureWarning`, and Celery tasks queued under the old names are still consumed. The
+[upgrade guide](/upgrading) has the details.
+
+### Smaller default install and images
+
+The document and vector-store engines that pulled the heaviest dependencies are now extras
+rather than defaults, so a stock install no longer carries PyTorch or the CUDA stack. The
+published image follows the same split: the default `arc53/docsgpt` image is the slim one, and
+`arc53/docsgpt:<version>-docling` bakes in the docling parser engine, its models and tesseract
+for OCR.
+
+### Faster embeddings, pinned to your installation
+
+Embeddings run through [FastEmbed](https://github.com/qdrant/fastembed) on ONNX Runtime. Query
+embedding now happens on the Celery worker rather than in the API process, which keeps the API
+small; a worker consuming the `embeddings` queue is required for search. The embedding model is
+pinned to the installation instead of following the release, so an upgrade never silently
+changes the model behind an existing index, and a query against an index built with a different
+model is now warned about. New installs default to
+`ibm-granite/granite-embedding-311m-multilingual-r2`, which is multilingual with a 32k-token
+context. The `reembed` script rebuilds vectors in place from the chunk text already stored.
+
+<Callout type="warning">
+  If you start your worker with an explicit `-Q`, add the `embeddings` queue. See
+  [Upgrading](/upgrading) for the one-line change and what happens without it.
+</Callout>
+
+### Broader document support
+
+Parsing gained support for more document, spreadsheet, presentation, EPUB, XHTML and image
+formats, along with a reworked OCR path. Parsing behaviour is configurable: markdown conversion,
+structured output, table reconstruction and improved PDF handling.
+
+### Agents and workflows
+
+Agents no longer require a source. The synthetic "Default" source is gone, and an agent with no
+source or retriever is a valid agent that lists and answers normally. Workflow agents can be
+exported and imported as files, so a workflow can move between deployments or into version
+control.
+
+Artifact and tool-call handling was hardened throughout: durable tasks retry rather than lose
+work on resume, tool calls are validated more strictly, and sandbox sessions are steadier.
+
+### Chat and attachments
+
+Cross-turn chaining against the Responses API is now bounded, conversation compression persists
+across turns instead of being recomputed, and requests carry prompt-cache hints. Attachments
+carry provenance through parsing, unparseable chat attachments are refused at upload rather than
+failing mid-answer, and the composer guards against sending while an attachment is still
+processing.
+
+### Widget
+
+The React widget got a UI refresh and an expand and collapse toggle, and was brought back in
+line with the current API contract. The npm packages `docsgpt` and `docsgpt-react` are published
+at 0.7.1.
+
+### Also in this release
+
+- The code-execution sandbox runner is published as `arc53/docsgpt-sandbox`, so the Kubernetes
+  manifest no longer needs an image you build yourself.
+- Releases publish the Docker images and the PyPI package from the release workflow.
+- The [architecture guide](/Guides/Architecture) was rewritten.
+- Markdown code spans are no longer corrupted by citation rendering.
+- `setup.ps1` runs on Windows PowerShell 5.1 again.
