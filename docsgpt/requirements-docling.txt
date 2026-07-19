@@ -260,7 +260,7 @@ fsspec==2026.7.0
     # via
     #   huggingface-hub
     #   torch
-google-api-core==2.36.0
+google-api-core==2.39.0
     # via google-api-python-client
 google-api-python-client==2.200.0
     # via docsgpt
