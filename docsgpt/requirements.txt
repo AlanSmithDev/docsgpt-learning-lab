@@ -509,7 +509,7 @@ opentelemetry-proto==1.44.0
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.0
     # via
     #   daytona
     #   opentelemetry-distro
