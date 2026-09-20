@@ -504,7 +504,7 @@ opentelemetry-instrumentation-starlette==0.65b0
     # via docsgpt
 opentelemetry-instrumentation-wsgi==0.65b0
     # via opentelemetry-instrumentation-flask
-opentelemetry-proto==1.44.0
+opentelemetry-proto==1.45.0
     # via
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
