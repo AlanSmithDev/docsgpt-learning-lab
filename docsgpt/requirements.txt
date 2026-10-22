@@ -213,7 +213,7 @@ frozenlist==1.8.0
     #   aiosignal
 fsspec==2026.7.0
     # via huggingface-hub
-google-api-core==2.36.0
+google-api-core==2.42.0
     # via google-api-python-client
 google-api-python-client==2.200.0
     # via docsgpt
