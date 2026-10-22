@@ -500,7 +500,7 @@ opentelemetry-instrumentation-requests==0.65b0
     # via docsgpt
 opentelemetry-instrumentation-sqlalchemy==0.65b0
     # via docsgpt
-opentelemetry-instrumentation-starlette==0.65b0
+opentelemetry-instrumentation-starlette==0.66b0
     # via docsgpt
 opentelemetry-instrumentation-wsgi==0.65b0
     # via opentelemetry-instrumentation-flask
