@@ -1148,7 +1148,7 @@ werkzeug==3.1.8
     #   flask-restx
 win32-setctime==1.2.0 ; sys_platform == 'win32'
     # via loguru
-wrapt==2.4.1
+wrapt==2.5.1
     # via
     #   deprecated
     #   opentelemetry-instrumentation
